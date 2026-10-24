@@ -57,19 +57,168 @@ umask 022
 : "${FORCE_REBUILD:=0}"                        # 1 = rebuild native libs and the release even if up to date
 : "${BASE_IMAGES_REF:=}"                       # override the immich-app/base-images commit (normally auto-detected)
 
+# Output
+: "${PLAIN:=0}"                                # 1 = no status header, plain scrolling output
+: "${LOG_FILE:=/var/log/immich-decompose.log}" # every run is appended here
+
 IMMICH_REPO=https://github.com/immich-app/immich
 BASE_IMAGES_REPO=https://github.com/immich-app/base-images
 STATE_DIR=/usr/local/share/immich-decompose         # stamps for what has been built into /usr/local
 export DEBIAN_FRONTEND=noninteractive
 
 # ------------------------------------------------------------------ Helpers --
-c_blue=$'\033[1;34m'; c_yel=$'\033[1;33m'; c_red=$'\033[1;31m'; c_grn=$'\033[1;32m'; c_off=$'\033[0m'
-log()  { printf '\n%s==> %s%s\n' "$c_blue" "$*" "$c_off"; }
-info() { printf '    %s\n' "$*"; }
+if [[ -t 1 ]]; then
+  c_blue=$'\033[1;34m'; c_yel=$'\033[1;33m'; c_red=$'\033[1;31m'; c_grn=$'\033[1;32m'; c_off=$'\033[0m'
+else
+  c_blue='' c_yel='' c_red='' c_grn='' c_off=''
+fi
+log()  { printf '\n%s==> %s%s\n' "$c_blue" "$*" "$c_off"; ui_send DETAIL "$*"; }
+info() { printf '    %s\n' "$*"; ui_send DETAIL "$*"; }
 warn() { printf '%sWARNING:%s %s\n' "$c_yel" "$c_off" "$*" >&2; }
 die()  { printf '%sERROR:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
 # shellcheck disable=SC2154
 trap 'rc=$?; printf "%sFAILED%s (exit %s) at line %s: %s\n" "$c_red" "$c_off" "$rc" "$LINENO" "$BASH_COMMAND" >&2' ERR
+
+# ------------------------------------------------------------ Status header --
+# On a terminal, the top lines of the screen show a fixed header (version, current step,
+# progress, elapsed time) while command output scrolls underneath. One writer process
+# owns the terminal, so output and header redraws never interleave. Everything is also
+# appended to $LOG_FILE. Without a terminal, or with PLAIN=1, output is plain.
+UI=0 UI_PID='' UI_FD='' UI_ORIG_OUT='' UI_ORIG_ERR='' STEP_N=0 STEP_TOTAL=0 STEP_TITLE=''
+UI_M=$'\x1e' UI_F=$'\x1f'      # message prefix and field separator for the writer
+
+# ui_send TYPE [FIELDS...]: update the header (no-op without the writer)
+ui_send() {
+  [[ $UI == 1 ]] || return 0
+  local IFS=$UI_F
+  printf '%s%s\n' "$UI_M" "$*" >&"$UI_FD"
+}
+
+# Runs in a process substitution: stdin is the script's output, stdout the terminal.
+ui_writer() {
+  set +eEu; trap - ERR EXIT; trap '' INT TERM HUP
+  shopt -s extglob
+  local tui=$1 log=$2 hdr=4 rows=0 cols=0 resized=0
+  local ver='' title='Starting' detail='' state=run n=0 total=0
+  local t0=$SECONDS ts=$SECONDS last=-1 line rc f
+  exec 3>>"$log"
+
+  _size() {
+    local sz; sz=$(stty size </dev/tty 2>/dev/null) || return 1
+    rows=${sz% *}; cols=${sz#* }
+    (( rows >= 12 && cols >= 50 ))
+  }
+  _clock() {
+    local t=$1
+    if (( t >= 3600 )); then printf '%d:%02d:%02d' $((t/3600)) $((t%3600/60)) $((t%60))
+    else printf '%02d:%02d' $((t/60)) $((t%60)); fi
+  }
+  # _row ROW COLOR LEFT RIGHT: one header line, left text truncated so RIGHT stays visible
+  _row() {
+    local room=$(( cols - ${#4} - 2 )) left=$3
+    (( ${#left} > room )) && left="${left:0:room-1}~"
+    printf '\e[%d;1H\e[2K%s%-*s %s\e[0m' "$1" "$2" "$room" "$left" "$4"
+  }
+  _draw() {
+    (( tui )) || return 0
+    local now=$SECONDS w=24 fill bar sl=''
+    fill=$(( total > 0 ? n * w / total : 0 ))
+    [[ $state == 'done' ]] && fill=$w
+    printf -v bar '%*s' "$fill" ''; bar=${bar// /#}
+    printf -v sl '%*s' $(( w - fill )) ''; bar="[$bar${sl// /.}]"
+    printf '\e7'
+    _row 1 $'\e[1m' " immich-decompose${ver:+  -  Immich $ver}" "total $(_clock $((now - t0)))"
+    case $state in
+      run)  _row 2 $'\e[1;34m' " $bar $n/$total  $title" "step $(_clock $((now - ts)))" ;;
+      'done') _row 2 $'\e[1;32m' " $bar  $title" "" ;;
+      fail) _row 2 $'\e[1;31m' " FAILED in step $n/$total: $title" "" ;;
+      stop) _row 2 $'\e[1;33m' " STOPPED in step $n/$total: $title" "" ;;
+    esac
+    _row 3 $'\e[2m' "   ${detail}" ""
+    local rule; printf -v rule '%*s' "$cols" ''; rule=${rule// /-}
+    local tag=" log: $log "
+    printf '\e[%d;1H\e[2K\e[2m%s%s%s\e[0m' 4 "${rule:0:3}" "$tag" "${rule:0:cols-3-${#tag}}"
+    printf '\e8'
+    last=$now
+  }
+  _region() {   # keep the header out of the scrolling area
+    printf '\e[%d;%dr\e[%d;1H' $((hdr + 1)) "$rows" "$rows"
+  }
+  _out() {      # _out TEXT [nl]: print to the scrolling area and the log
+    if [[ ${2:-} == nl ]]; then printf '%s\n' "$1"; printf '%s\n' "${1//$'\e'\[*([0-9;])m/}" >&3
+    else printf '%s' "$1"; printf '%s' "${1//$'\e'\[*([0-9;])m/}" >&3; fi
+  }
+  _msg() {      # header message from ui_send
+    local -a m; IFS=$UI_F read -r -a m <<<"${1#"$UI_M"}"
+    case ${m[0]} in
+      VER)    ver=${m[1]} ;;
+      STEP)   n=${m[1]}; total=${m[2]}; title=${m[3]}; detail=''; ts=$SECONDS ;;
+      DETAIL) detail=${m[1]} ;;
+      DONE)   state='done'; title=${m[1]}; detail=${m[2]:-} ;;
+      FAIL)   state=fail; n=${m[1]}; total=${m[2]}; title=${m[3]}
+              if (( m[4] >= 129 && m[4] <= 143 )); then state=stop; detail="stopped by a signal (exit code ${m[4]}); re-run to continue"
+              else detail="exit code ${m[4]}, see the output above and $log"; fi ;;
+    esac
+    _draw
+  }
+
+  if (( tui )) && _size; then
+    trap 'resized=1' WINCH
+    printf '%*s' "$rows" '' | tr ' ' '\n'   # push what is on screen into scrollback
+    printf '\e[H'; _region; _draw
+  else
+    tui=0
+  fi
+
+  while :; do
+    if IFS= read -r -t 1 line; then
+      if [[ $line == "$UI_M"* ]]; then _msg "$line"; else _out "$line" nl; fi
+    else
+      rc=$?
+      [[ -n $line && $line != "$UI_M"* ]] && _out "$line"   # partial line (timeout) or last line (EOF)
+      (( rc > 128 )) || break                                  # EOF
+    fi
+    if (( resized )); then resized=0; _size && { _region; _draw; }; fi
+    (( tui && SECONDS != last )) && _draw
+  done
+
+  if (( tui )); then   # give the terminal back: full-screen scrolling, cursor at the bottom
+    _draw
+    printf '\e7\e[r\e8'   # resetting the region homes the cursor, so restore it after
+  fi
+  exec 3>&-
+}
+
+ui_start() {
+  mkdir -p "$(dirname "$LOG_FILE")"
+  printf '\n===== %s  immich-decompose %s =====\n' "$(date -Is)" "$*" >> "$LOG_FILE"
+  local tui=0
+  [[ -t 1 && $PLAIN != 1 && ${TERM:-dumb} != dumb ]] && tui=1
+  exec {UI_ORIG_OUT}>&1 {UI_ORIG_ERR}>&2
+  exec > >(ui_writer "$tui" "$LOG_FILE") 2>&1
+  UI_PID=$!
+  exec {UI_FD}>&1
+  UI=1
+  trap ui_stop EXIT
+  # bash would run the EXIT trap with status 0 after a signal; make the status explicit
+  trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+}
+
+ui_stop() {
+  local rc=$?
+  [[ $UI == 1 ]] || return 0
+  if (( rc == 0 )); then
+    local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    ui_send DONE "Immich $IMMICH_VERSION is running" "web UI: http://${ip:-<host>}:2283"
+  else
+    ui_send FAIL "$STEP_N" "$STEP_TOTAL" "$STEP_TITLE" "$rc"
+  fi
+  UI=0
+  # closing our ends of the pipe lets the writer finish and restore the terminal
+  exec >&"$UI_ORIG_OUT" 2>&"$UI_ORIG_ERR" {UI_FD}>&-
+  local _i; for _i in {1..50}; do kill -0 "$UI_PID" 2>/dev/null || return 0; sleep 0.1; done
+  kill "$UI_PID" 2>/dev/null; printf '\e[r' >&"$UI_ORIG_OUT"
+}
 
 # env_get KEY FILE: last value of KEY in an env file, quotes stripped (empty if unset)
 env_get() { { grep -oP "^$1=\K.*" "$2" 2>/dev/null || true; } | tail -n1 | tr -d "\"'"; }
@@ -107,7 +256,6 @@ LIBDIR_ARCH=$(uname -m)-linux-gnu
 # --------------------------------------------------------------- Preflight --
 preflight() {
   log "Checking the system"
-  [[ $EUID -eq 0 ]] || die "run as root"
   [[ $ARCH != unsupported ]] || die "only amd64 and arm64 are supported"
   # shellcheck source=/dev/null
   . /etc/os-release
@@ -138,6 +286,7 @@ resolve_version() {
   fi
   [[ $IMMICH_VERSION == v* ]] || IMMICH_VERSION="v$IMMICH_VERSION"
   log "Immich version: $IMMICH_VERSION"
+  ui_send VER "$IMMICH_VERSION"
 }
 
 # ------------------------------------------------------------ APT packages --
@@ -445,13 +594,13 @@ pnpm_env() {
 build_server() {
   log "Building server, web and CLI"
   pnpm_env
-  info "SDKs"
+  info "building SDKs"
   pnpm --filter @immich/sdk install --frozen-lockfile
   pnpm --filter @immich/sdk build
   pnpm --filter @immich/plugin-sdk install --frozen-lockfile
   pnpm --filter @immich/plugin-sdk build
 
-  info "server"
+  info "building server"
   pnpm --filter immich install --frozen-lockfile
   pnpm --filter immich build
   pnpm --filter immich --prod --no-optional deploy "$REL/server"
@@ -459,18 +608,18 @@ build_server() {
   SHARP_FORCE_GLOBAL_LIBVIPS=true pnpm --config.verify-deps-before-run=false \
     --dir "$REL/server/node_modules/sharp" exec npm run build
 
-  info "web"
+  info "building web UI"
   pnpm --filter immich-web install --frozen-lockfile
   pnpm --filter immich-web build
   cp -a "$SRC/web/build" "$REL/build/www"
 
-  info "cli"
+  info "building CLI"
   pnpm --filter @immich/cli install --frozen-lockfile
   pnpm --filter @immich/cli build
   pnpm --filter @immich/cli --prod --no-optional deploy "$REL/cli"
   ln -sfn ../../cli/bin/immich "$REL/server/bin/immich"
 
-  info "geodata"
+  info "downloading geodata"
   # same files the base image ADDs to /build/geodata
   local geo=$REL/build/geodata url name
   mkdir -p "$geo"
@@ -811,6 +960,7 @@ summary() {
   Media:         $UPLOAD_LOCATION
   Model cache:   $ML_CACHE_LOCATION
   Logs:          journalctl -u immich-server -u immich-machine-learning -f
+  Install log:   $LOG_FILE
   Admin CLI:     immich-admin --help
   Upgrade:       $0 upgrade            (or: $0 upgrade vX.Y.Z)
 EOF
@@ -838,22 +988,34 @@ main() {
     *) die "unknown command '$cmd' (use install, upgrade or status)" ;;
   esac
 
-  preflight
-  setup_apt
-  resolve_version
-  install_packages
-  fetch_sources
-  setup_user_and_config        # creates/reads DB_PASSWORD
-  install_valkey
-  install_postgres
-  install_node
-  build_base_libs
-  install_ffmpeg
-  install_intel_opencl
-  build_release
-  write_units
-  activate_release
-  prune
+  [[ $EUID -eq 0 ]] || die "run as root"
+
+  local steps=(
+    "preflight|Checking the system"
+    "setup_apt|Configuring APT"
+    "resolve_version|Resolving the release"
+    "install_packages|Installing packages"
+    "fetch_sources|Fetching sources"
+    "setup_user_and_config|User and configuration"   # creates/reads DB_PASSWORD
+    "install_valkey|Valkey"
+    "install_postgres|PostgreSQL"
+    "install_node|Node.js"
+    "build_base_libs|Image libraries"
+    "install_ffmpeg|ffmpeg"
+    "install_intel_opencl|Intel OpenCL runtime"
+    "build_release|Building Immich"
+    "write_units|systemd units"
+    "activate_release|Starting Immich"
+    "prune|Cleaning up"
+  )
+  ui_start "$*"
+  STEP_TOTAL=${#steps[@]}
+  local s
+  for s in "${steps[@]}"; do
+    STEP_N=$((STEP_N + 1)); STEP_TITLE=${s#*|}
+    ui_send STEP "$STEP_N" "$STEP_TOTAL" "$STEP_TITLE"
+    "${s%%|*}"
+  done
   summary
 }
 

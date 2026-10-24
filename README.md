@@ -14,6 +14,10 @@ with the script here, not to the Immich team.
 ./immich-decompose.sh status
 ```
 
+On a terminal, the top of the screen shows a fixed header with the release, the
+current step, a progress bar and elapsed times, while the command output scrolls
+underneath. All output is also appended to `/var/log/immich-decompose.log`.
+
 ## Requirements
 
 - **System**: Debian 13, amd64 or arm64, with systemd as init. Run the script as root.
@@ -98,6 +102,13 @@ Pass these as environment variables, e.g. `UPLOAD_LOCATION=/mnt/photos ./immich-
 | `KEEP_RELEASES`     | `2`                      | Built releases kept in `/opt/immich/releases` |
 | `FORCE_REBUILD`     | `0`                      | `1` rebuilds everything |
 | `BASE_IMAGES_REF`   | auto-detected            | Override the `immich-app/base-images` commit |
+
+**Output**
+
+| Variable   | Default                         | Notes |
+|------------|---------------------------------|-------|
+| `PLAIN`    | `0`                             | `1` turns off the header (it is also off when output isn't a terminal) |
+| `LOG_FILE` | `/var/log/immich-decompose.log` | Every run is appended here |
 
 Runtime settings (TZ, port, and so on) go in `/etc/immich/immich.env`, the same
 variables as the Docker `.env`. Then run

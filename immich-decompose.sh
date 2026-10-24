@@ -98,7 +98,9 @@ ui_send() {
 ui_writer() {
   set +eEu; trap - ERR EXIT; trap '' INT TERM HUP
   shopt -s extglob
-  local tui=$1 log=$2 hdr=4 rows=0 cols=0 resized=0
+  local tui=$1 log=$2 hdr=4 rows=0 cols=0 resized=0 hidden=0
+  local -a buf=()        # recent output lines, reprinted after a resize
+  local pending=''       # current unfinished output line
   local ver='' title='Starting' detail='' state=run n=0 total=0
   local t0=$SECONDS ts=$SECONDS last=-1 line rc f
   exec 3>>"$log"
@@ -120,7 +122,7 @@ ui_writer() {
     printf '\e[%d;1H\e[2K%s%-*s %s\e[0m' "$1" "$2" "$room" "$left" "$4"
   }
   _draw() {
-    (( tui )) || return 0
+    (( tui && !hidden )) || return 0
     local now=$SECONDS w=24 fill bar sl=''
     fill=$(( total > 0 ? n * w / total : 0 ))
     [[ $state == 'done' ]] && fill=$w
@@ -145,8 +147,28 @@ ui_writer() {
     printf '\e[%d;%dr\e[%d;1H' $((hdr + 1)) "$rows" "$rows"
   }
   _out() {      # _out TEXT [nl]: print to the scrolling area and the log
-    if [[ ${2:-} == nl ]]; then printf '%s\n' "$1"; printf '%s\n' "${1//$'\e'\[*([0-9;])m/}" >&3
-    else printf '%s' "$1"; printf '%s' "${1//$'\e'\[*([0-9;])m/}" >&3; fi
+    if [[ ${2:-} == nl ]]; then
+      printf '%s\n' "$1"; printf '%s\n' "${1//$'\e'\[*([0-9;])m/}" >&3
+      buf+=("$pending$1"); pending=''
+      (( ${#buf[@]} > 600 )) && buf=("${buf[@]:100}")
+    else
+      printf '%s' "$1"; printf '%s' "${1//$'\e'\[*([0-9;])m/}" >&3
+      pending+=$1
+    fi
+  }
+  # After a resize the terminal may have reflowed or pulled scrollback onto the screen,
+  # leaving stale header copies around. Start from a clean screen instead: clear it,
+  # set up the region again and reprint the latest output under a fresh header.
+  _repaint() {
+    printf '\e[r\e[H\e[2J'
+    if ! _size; then hidden=1; printf '\e[%d;1H' "${rows:-1}"; return; fi   # too small: plain scrolling
+    hidden=0
+    _region
+    local i start=$(( ${#buf[@]} - (rows - hdr - 1) ))
+    (( start < 0 )) && start=0
+    for (( i = start; i < ${#buf[@]}; i++ )); do printf '%s\n' "${buf[i]}"; done
+    printf '%s' "$pending"
+    _draw
   }
   _msg() {      # header message from ui_send
     local -a m; IFS=$UI_F read -r -a m <<<"${1#"$UI_M"}"
@@ -178,11 +200,15 @@ ui_writer() {
       [[ -n $line && $line != "$UI_M"* ]] && _out "$line"   # partial line (timeout) or last line (EOF)
       (( rc > 128 )) || break                                  # EOF
     fi
-    if (( resized )); then resized=0; _size && { _region; _draw; }; fi
+    if (( resized )); then
+      # wait until the window stops changing size (dragging sends many signals)
+      while (( resized )); do resized=0; sleep 0.2; done
+      _repaint
+    fi
     (( tui && SECONDS != last )) && _draw
   done
 
-  if (( tui )); then   # give the terminal back: full-screen scrolling, cursor at the bottom
+  if (( tui && !hidden )); then   # give the terminal back: full-screen scrolling
     _draw
     printf '\e7\e[r\e8'   # resetting the region homes the cursor, so restore it after
   fi
